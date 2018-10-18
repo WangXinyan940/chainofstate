@@ -1,6 +1,6 @@
 # chainofstate
 
-With this tool, you can use chain-of-state methods for describing reaction pathway with different Quantum Mechanism engines.
+With this tool, you can use chain-of-state methods for describing minimum energy path (MEP) with different Quantum Mechanism engines.
 
 This script support:
 
