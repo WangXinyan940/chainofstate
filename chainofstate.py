@@ -78,15 +78,21 @@ def calcXTBHess(topo,xyz):
     return hess
 
 #Gaussian
-def writeGauForce(topo, xyz, n):
-    with open("tmp", "w") as f:
+def writeGauForce(topo, xyz, n, nproc, method, basis, extra, charge, multi, endfile):
+    with open("force.gjf", "w") as f:
+        f.write("%nproc={}\n".format(nproc))
+        f.write("%mem=2000mw\n")
+        if "force_%i.chk"%n in os.listdir("."):
+            f.write("%oldchk=force_{}.chk\n%chk=force.chk\n".format(n))
+            readg = True
+        else:
+            f.write("%chk=force.chk\n")
+            readg = False
+        f.write("#p {} {} {} {} force nosymm\n\nTitle\n\n{} {}\n".format(method, basis, "guess=read" if readg else "", extra, charge, multi))
         anum = len(topo.atoms)
         for i in range(anum):
             f.write("%s%15.8f%15.8f%15.8f\n"%(topo.atoms[i],xyz[i,0],xyz[i,1],xyz[i,2]))
-    if "force_%i.chk"%n in os.listdir("."):
-        os.system('echo "%oldchk=force_{}.chk\n%chk=force.chk" | cat - template.gjf tmp tmpend > force.gjf && rm tmp'.format(n))
-    else:
-        os.system("echo %chk=force.chk | cat - template0.gjf tmp tmpend > force.gjf && rm tmp")
+        f.write("\n{}\n\n\n\n".format(endfile))
 
 def readGauEnerForce(topo):
     with open("force.log", "r") as f:
@@ -105,10 +111,10 @@ def readGauEnerForce(topo):
         forces = [[np.float64(i[0]), np.float64(i[1]), np.float64(i[2])] for i in forces]
     return ener,-np.array(forces)
 
-def mkGauFunc(command):
+def mkGauFunc(command, nproc, method='', basis='', extra='', charge=0, multi=1, endfile=''):
     def calcGauForce(topo,xyz,n):
-        writeGauForce(topo, xyz, n)
-        os.system("g09 force.gjf")
+        writeGauForce(topo, xyz, n, nproc, method, basis, extra, charge, multi, endfile)
+        os.system("{} force.gjf".format(command))
         e,f = readGauEnerForce(topo)
         os.system("cp force.chk force_%i.chk"%n)
         os.system("rm force.gjf force.log")
@@ -395,44 +401,18 @@ def runChainOfState(topo,xyzs,force,method="STRING",fixend=False,k=0.1,sk=0.5,de
 
 if __name__ == "__main__":
     #Argparse
-    import argparse
-    parser = argparse.ArgumentParser()
-    #QM Engine
-    parser.add_argument("-e","--engine",help="QM Engine [G09/XTB/ORCA]",default="G09")
-    #Algorithm
-    parser.add_argument("-a","--alg",help="Algorithm [STRING/NEB/CINEB]",default="STRING")
-    #Fix-end
-    parser.add_argument("-f","--fixend",help="Fix-end [Default False]", action="store_true")
-    #k for norm of forces
-    parser.add_argument("-n","--norm",help="Norm const for displacement [Default 0.1 A]", type=float,default=0.1)
-    #sk for spring K const
-    parser.add_argument("-k","--springK",help="Spring const [Default 0.0025]", type=float,default=0.0025)
-    #Structures
-    parser.add_argument("--inter",help="Structures added between two init structures. [Default 3]", type=int,default=3)
-    #Files
-    parser.add_argument("files",metavar="F",type=str,nargs="+",help="File names of init structures.")
-    #Cycles
-    parser.add_argument("-c","--cycles",type=int,help="Iteration cycles [Default 20]", default=20)
-    #EnStart
-    parser.add_argument("--enfirst", type=float, help="Energy of the first image. Only be used in CINEB. [kcal/mol]", default=-9999.0)
-    #EnEnd
-    parser.add_argument("--enlast", type=float, help="Energy of the last image. Only be used in CINEB. [kcal/mol]", default=-9999.0)
-    print("###################################################")
-    print("#                                                 #")
-    print("# Chain of State Toolbox                          #")
-    print("#                                                 #")
-    print("# ENV needed:                                     #")
-    print("#                                                 #")
-    print("# ORCA: ORCA_COMMAND                              #")
-    print("# XTB: XTB_COMMAND                                #")
-    print("#                                                 #")
-    print("###################################################")
-    args = parser.parse_args()
+    import json
     env_dir = os.environ
+    if len(sys.argv[]) > 1:
+        config_name = sys.argv[1]
+    else:
+        config_name = "config.json"
+    with open(config_name, "r") as f:
+        config = json.load(f)
 
-    inter = args.inter + 1
+    inter = config["inter"] + 1
     initxyz = []
-    for i in args.files:
+    for i in config["files"]:
         topo,xyz = readXYZ(i)
         initxyz.append(xyz)
     xyzs = [initxyz[0]]
@@ -440,20 +420,19 @@ if __name__ == "__main__":
         for j in range(1,inter):
             xyzs.append(initxyz[i] * (inter - 1 - j) / (inter - 1) + initxyz[i+1] * j / (inter - 1))
 
-    engine = args.engine
-    method = args.alg
-    if engine == "G09":
-        force = mkGauFunc("g09")
+    engine = config["engine"]
+    method = config["algorithm"]
+    if engine == "GAU":
+        force = mkGauFunc(config["gau_command"], config["nproc"], method=config["gau_method"], basis=config["gau_basis"], extra=config["gau_extra"], charge=config["charge"], multi=config["multi"], endfile=config["gau_endfile"])
     if engine == "XTB":
-        force = mkXTBFunc(env_dir["XTB_COMMAND"])
+        force = mkXTBFunc(config["xtb_command"])
     if engine == "ORCA":
-        force = mkORCAFunc(env_dir["ORCA_COMMAND"])
+        force = mkORCAFunc(config["orca_command"])
 
-    for i in range(args.cycles):
+    for i in range(config["cycles"]):
         print("CYCLE %i:"%i)
-        e,xyzs = runChainOfState(topo,xyzs,force,method=method,fixend=args.fixend,k=args.norm,sk=args.springK,enfirst=args.enfirst,enlast=args.enlast)
+        e,xyzs = runChainOfState(topo,xyzs,force,method=method,fixend=config["fixend"],k=config["norm"],sk=config["springK"],enfirst=config["enfirst"],enlast=config["enlast"])
         for n,xyz in enumerate(xyzs):
             writeXYZ("force%i_%i"%(i,n),topo,xyz,title="%f"%e[n])
         #e,xyzs = gausimplestring(topo,xyzs)
         print("MAX: %f\n"%e[1:-1].max())
-
