@@ -1,0 +1,13 @@
+%nproc=8
+%mem=2000mw
+#p B3LYP/6-31G* em=gd3 force nosymm
+
+[title]
+
+0 1
+[coord]
+
+
+
+
+

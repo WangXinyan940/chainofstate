@@ -1,6 +1,7 @@
 import numpy as np 
 from scipy import interpolate
 import os,sys
+
 BOHR = 5.291772108e-11  # Bohr -> m
 ANGSTROM = 1e-10  # angstrom -> m
 AMU = 1.660539040e-27  # amu -> kg
@@ -82,7 +83,8 @@ def genQMInput(atom, crd, temp):
             for ni in range(len(atom)):
                 wrt.append("%s  %16.8f %16.8f %16.8f\n" %
                            (atom[ni], crd[ni][0] / ANGSTROM, crd[ni][1] / ANGSTROM, crd[ni][2] / ANGSTROM))
-        wrt.append(line)
+        else:
+            wrt.append(line)
     return "".join(wrt)
 
 def genMassMat(atom):
@@ -111,7 +113,6 @@ def calcGauGrad(atom, crd, template, path="g09"):
         f.write(genQMInput(atom, crd, template))
     os.system("{} tmp.gjf".format(path))
     grad = readFile("tmp.log", lambda x: readGauGrad(x, len(atom)))
-    os.system("cp tmp.chk old.chk")
     return grad
 
 #Chain-of-state
@@ -144,7 +145,7 @@ def genPosFunc(pos_list, val_list):
     """
     list1d = [i.ravel() for i in pos_list]
     funclist = []
-    for p in range(list1d.shape[0]):
+    for p in range(len(list1d[0])):
         k = [i[p] for i in list1d]
         funclist.append(interpolate.interp1d(val_list,k,kind="cubic"))
     def posfunc(alpha):
@@ -159,19 +160,19 @@ def numGrad(posfunc, alpha):
     """
     Numerically calc the gradient at each point.
     """
-    delta = 0.002
+    delta = 0.0001
     grad1d = (posfunc(alpha + delta) - posfunc(alpha - delta)) / 2. / delta
-    return grad1d.reshape((-1, 3))
+    return grad1d
 
 
 def genLinearConf(start, end, points):
     confs = []
-    for i in range(points + 1):
-        confs.append(start * (1 - i/points) + end * i/points)
+    for i in range(points):
+        confs.append(start * (1 - i/(points - 1)) + end * i/(points - 1))
     return confs 
 
 
-def runChainOfState(atom, xyzs, method="NEB", force=None, template=None, Kspring=10.0*KCAL/MOL/ANGSTROM**2, Rstep=0.5, dG=-1.*KCAL/MOL, dR=0.1*ANGSTROM, maxcycle):
+def runChainOfState(atom, xyzs, method="NEB", force=None, template=None, Kspring=10.0*KCAL/MOL/ANGSTROM**2, Rstep=0.5, Rmax=0.1*ANGSTROM, dR=0.1*ANGSTROM, maxcycle=100):
     # calc the energy of the first and last structure
     efirst, _ = calcGauGrad(atom, xyzs[0], template)
     elast, _ = calcGauGrad(atom, xyzs[-1], template)
@@ -184,25 +185,29 @@ def runChainOfState(atom, xyzs, method="NEB", force=None, template=None, Kspring
     massm = genMassMat(atom)
     energy[0] = efirst
     energy[-1] = elast
+    moves = np.zeros(energy.shape)
     for ncycle in range(1, maxcycle+1):
         print("Cycle %i"%ncycle)
         # calc gradient of PE
-        for nimage in range(1,len(xyzs)-1):
-            e,g = calcGauGrad(atom, coord[nimage], template)
-            energy[nimage] = e
-            pe_grad[nimage] = g 
-            print("E: %.4f  "%e, end="")
+        for nimage in range(len(xyzs)):
+            if nimage != 0 and nimage != len(xyzs) - 1:
+                e,g = calcGauGrad(atom, coord[nimage], template)
+                energy[nimage] = e
+                pe_grad[nimage] = g 
+            print("E: %.4f  "%((energy[nimage] - energy[0]) / (KCAL / MOL)), end="  ")
         print()
         # get pathway
         alpha = [0.0]
         for n in range(1,len(xyzs)):
-            alpha.append(sum(alpha) + distance(xyzs[n-1], xyzs[n]))
-        alpha = [i / sum(alpha) for i in alpha]
+            alpha.append(alpha[n-1] + distance(coord[n-1], coord[n]))
+        alpha = [i / alpha[-1] for i in alpha]
         posfunc = genPosFunc(coord, alpha)
         if "NEB" in method:
+            grad_sum = [np.zeros(i.shape) for i in xyzs]
+
             # get direction of NEB gradient
             for n,a in enumerate(alpha):
-                if n == 0 or n == len(alpha):
+                if n == 0 or n == len(alpha) - 1:
                     continue
                 path_grad[n] = numGrad(posfunc, a)
             # calc elastic band grad
@@ -220,10 +225,40 @@ def runChainOfState(atom, xyzs, method="NEB", force=None, template=None, Kspring
                 else:
                     _, gh = decomp(neb_grad[i], path_grad[i])
                 gsum = gv + gh
-                # renew position
-                coord[i] = coord[i] - Rstep * gsum / massm 
+                moves[i] = np.sqrt(np.power(Rstep * gsum, 2).sum())
+                grad_sum[i] = gsum
+                if max(moves) > Rmax:
+                    scale = Rmax / max(moves)
+                else:
+                    scale = 1.0
+            # renew position
+            for i in range(1, len(xyzs)-1):
+                coord[i] = coord[i] - Rstep * grad_sum[i] * scale
+        print(moves / ANGSTROM) 
         # output pathway
         for i in range(len(xyzs)):
             title = "Cycle %i    Image %i    Energy:%.6f\n"%(ncycle, i, energy[i] / EH)
-            writeXYZ("pathway-%i.xyz"%i, atom, coord[i], title=title, append=True)
+            writeXYZ("pathway-%i.xyz"%ncycle, atom, coord[i], title=title, append=True)
+        if moves.max() < dR:
+            print("Converged.")
+            print("Exit.")
+            return 
+    print("Num of cycles is not enough.")
+    print("Exit.")
+    return
 
+
+
+def main():
+    atom, crd0 = readFile(sys.argv[1], readXYZ)
+    _, crd1 = readFile(sys.argv[2], readXYZ)
+    if len(sys.argv) > 3:
+        _, crd2 = readFile(sys.argv[3], readXYZ)
+        xyzs = genLinearConf(crd0 * ANGSTROM, crd1 * ANGSTROM, 5) + genLinearConf(crd1 * ANGSTROM, crd2 * ANGSTROM, 5)[1:]
+    else:
+        xyzs = genLinearConf(crd0 * ANGSTROM, crd1 * ANGSTROM, 9)
+    runChainOfState(atom, xyzs, method="CINEB", force=None, template="template.gjf", Kspring=5.0*KCAL/MOL/ANGSTROM**2, Rstep=0.001, Rmax=0.10*ANGSTROM, dR=0.01*ANGSTROM, maxcycle=30)
+
+
+if __name__ == '__main__':
+    main()
