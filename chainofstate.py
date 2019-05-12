@@ -1,438 +1,229 @@
 import numpy as np 
 from scipy import interpolate
 import os,sys
+BOHR = 5.291772108e-11  # Bohr -> m
+ANGSTROM = 1e-10  # angstrom -> m
+AMU = 1.660539040e-27  # amu -> kg
+FS = 1e-15  # fs -> s
+EH = 4.35974417e-18  # Hartrees -> J
+KJ = 1000.0
+KCAL = KJ * 4.184
+H = 6.626069934e-34
+KB = 1.38064852e-23
+MOL = 6.02e23
+
  
-class Topo(object): 
  
-    def __init__(self,atoms): 
-        self.atoms = atoms 
- 
- 
-def readXYZ(fname): 
-    with open(fname, "r") as f: 
-        text = f.readlines() 
-    line = int(text[0].strip()) 
-    text = text[2:line+2] 
-    text = [i.strip().split() for i in text] 
-    topo = Topo([i[0] for i in text]) 
-    xyz = [[float(i[1]),float(i[2]),float(i[3])] for i in text] 
-    return topo,np.array(xyz) 
- 
-def writeXYZ(name,topo,xyz,title="Title"):
-    with open("%s.xyz"%name, "w") as f:
-        anum = len(topo.atoms)
-        f.write("%i\n%s\n"%(anum,title))
-        for i in range(anum):
-            f.write("%s%15.8f%15.8f%15.8f\n"%(topo.atoms[i],xyz[i,0],xyz[i,1],xyz[i,2]))
+def readFile(fname, func):
+    """
+    Read text file and deal with different functions.
+    """
+    with open(fname, "r") as f:
+        text = [i for i in f if i.strip()]
+    return func(text)
 
-#XTB
-def writeXTBForce(topo, xyz,n): 
-    with open("force.xyz", "w") as f: 
-        anum = len(topo.atoms) 
-        f.write("%i\nForce\n"%anum) 
-        for i in range(anum): 
-            f.write("%s%15.8f%15.8f%15.8f\n"%(topo.atoms[i],xyz[i,0],xyz[i,1],xyz[i,2])) 
- 
-def readXTBForce(): 
-    with open("grad", "r") as f: 
-        text = f.readlines() 
-    text = [float(i[4:].strip().split()[0]) if "*****" not in i else 0.0 for i in text if len(i.strip()) > 10] 
-    text = np.array(text) 
-    return text.reshape((int(len(text) / 3), 3)) 
- 
-def readXTBEnergy(): 
-    with open("LOG", "r") as f: 
-        text = f.readlines() 
-    text = [i for i in text if "total E" in i][0] 
-    return float(text.strip().split()[-1]) 
 
-def mkXTBFunc(command):
-    tot_command = "%s force.xyz -chrg 0 -uhf 0 -grad > LOG"%command
-    def calcXTBForce(topo, xyz,n): 
-        writeXTBForce(topo, xyz,n) 
-        os.system(tot_command) 
-        energy = readXTBEnergy() 
-        force = readXTBForce()
-        os.system("rm LOG force.xyz energy grad") 
-        return energy,force 
-    return calcXTBForce
+def readXYZ(text):
+    """
+    Read xyz format text.
+    """
+    natoms = int(text[0].strip())
+    body = text[2:natoms + 2]
+    body = [i.strip().split() for i in body]
+    atom = [i[0] for i in body]
+    crd = [[float(j) for j in i[1:]] for i in body]
+    return atom, np.array(crd)
 
-def writeXTBHess(topo, xyz): 
-    with open("hess.xyz", "w") as f: 
-        anum = len(topo.atoms) 
-        f.write("%i\nHessian\n"%anum) 
-        for i in range(anum): 
-            f.write("%s%15.8f%15.8f%15.8f\n"%(topo.atoms[i],xyz[i,0],xyz[i,1],xyz[i,2])) 
+def readGauGrad(text, natoms):
+    """
+    Read Gaussian output and find energy gradient.
+    """
+    ener = [i for i in text if "SCF Done:" in i]
+    if len(ener) != 0:
+        ener = ener[-1]
+        ener = np.float64(ener.split()[4])
+    else:
+        ener = np.float64([i for i in text if "Energy=" in i][-1].split()[1])
+    for ni, li in enumerate(text):
+        if "Forces (Hartrees/Bohr)" in li:
+            break
+    forces = text[ni + 3:ni + 3 + natoms]
+    forces = [i.strip().split()[-3:] for i in forces]
+    forces = [[np.float64(i[0]), np.float64(i[1]), np.float64(i[2])]
+              for i in forces]
+    return ener * EH, - np.array(forces) * EH / BOHR
 
-def calcXTBHess(topo,xyz):
-    writeXTBHess(topo, xyz)
-    os.system(os.environ["XTB_COMMAND"] + "hess.xyz -chrg 0 -uhf 0 -grad > HESSLOG")
-    with open("hessian", "r") as f:
-        text = f.readlines()
-    text = [[float(j) for j in i.strip().split()] for i in text[1:]]
-    hess = []
-    for i in text:
-        for j in i:
-            hess.append(j)
-    hess = np.array(hess).reshape((xyz.shape[0] * xyz.shape[1],xyz.shape[0] * xyz.shape[1]))
-    return hess
+def writeXYZ(fname, atom, xyz, title="Title", append=False, unit=ANGSTROM):
+    """
+    Write file with XYZ format. 
+    """
+    if append:
+        f = open(fname, "a")
+    else:
+        f = open(fname, "w")
+    f.write("%i\n" % len(atom))
+    f.write("%s\n" % (title.rstrip()))
+    for i in range(len(atom)):
+        x, y, z = xyz[i, :]
+        f.write("%s  %12.8f %12.8f %12.8f\n" % (atom[i], x / unit, y / unit, z / unit))
+    f.close()
 
-#Gaussian
-def writeGauForce(topo, xyz, n, nproc, method, basis, extra, charge, multi, endfile):
-    with open("force.gjf", "w") as f:
-        f.write("%nproc={}\n".format(nproc))
-        f.write("%mem=2000mw\n")
-        if "force_%i.chk"%n in os.listdir("."):
-            f.write("%oldchk=force_{}.chk\n%chk=force.chk\n".format(n))
-            readg = True
-        else:
-            f.write("%chk=force.chk\n")
-            readg = False
-        f.write("#p {} {} {} {} force nosymm\n\nTitle\n\n{} {}\n".format(method, basis, "guess=read" if readg else "", extra, charge, multi))
-        anum = len(topo.atoms)
-        for i in range(anum):
-            f.write("%s%15.8f%15.8f%15.8f\n"%(topo.atoms[i],xyz[i,0],xyz[i,1],xyz[i,2]))
-        f.write("\n{}\n\n\n\n".format(endfile))
+def genQMInput(atom, crd, temp):
+    """
+    Generate QM Input file for force calculation.
+    """
+    with open(temp, "r") as f:
+        temp = f.readlines()
+    wrt = []
+    for line in temp:
+        if "[title]" in line:
+            wrt.append("Temparary input file\n")
+        elif "[coord]" in line:
+            for ni in range(len(atom)):
+                wrt.append("%s  %16.8f %16.8f %16.8f\n" %
+                           (atom[ni], crd[ni][0] / ANGSTROM, crd[ni][1] / ANGSTROM, crd[ni][2] / ANGSTROM))
+        wrt.append(line)
+    return "".join(wrt)
 
-def readGauEnerForce(topo):
-    with open("force.log", "r") as f:
-        text = f.readlines()
-        ener = [i for i in text if "SCF Done:" in i]
-        if len(ener) != 0:
-            ener = ener[-1]
-            ener = np.float64(ener.split()[4])
-        else:
-           ener = np.float64([i for i in text if "Energy=" in i][-1].split()[1]) 
-        for ni, li in enumerate(text):
-            if "Forces (Hartrees/Bohr)" in li:
-                break
-        forces = text[ni+3:ni+3+len(topo.atoms)]
-        forces = [i.strip().split()[-3:] for i in forces]
-        forces = [[np.float64(i[0]), np.float64(i[1]), np.float64(i[2])] for i in forces]
-    return ener,-np.array(forces)
+def genMassMat(atom):
+    """
+    Generate matrix of mass.
+    """
+    massd = {"H": 1.008,
+             "C": 12.011,
+             "N": 14.007,
+             "O": 15.999,
+             "S": 32.066,
+             "CL": 35.453,
+             "BR": 79.904, }
+    massv = np.array([massd[i.upper()] for i in atom])
+    massm = np.zeros((len(atom), 3))
+    massm[:, 0] = massv
+    massm[:, 1] = massv
+    massm[:, 2] = massv
+    return massm.reshape((-1, 3)) * AMU
 
-def mkGauFunc(command, nproc, method='', basis='', extra='', charge=0, multi=1, endfile=''):
-    def calcGauForce(topo,xyz,n):
-        writeGauForce(topo, xyz, n, nproc, method, basis, extra, charge, multi, endfile)
-        os.system("{} force.gjf".format(command))
-        e,f = readGauEnerForce(topo)
-        os.system("cp force.chk force_%i.chk"%n)
-        os.system("rm force.gjf force.log")
-        return e,f
-    return calcGauForce
-
-#ORCA
-def writeORCAForce(topo,xyz):
-    with open("tmp", "w") as f:
-        anum = len(topo.atoms)
-        for i in range(anum):
-            f.write("%s%15.8f%15.8f%15.8f\n"%(topo.atoms[i],xyz[i,0],xyz[i,1],xyz[i,2]))
-        f.write("*\n\n\n\n")
-    os.system("cat template.inp tmp > force.inp && rm tmp")
-
-def readORCAEnerForce():
-    with open("force.engrad", "r") as f:
-        text = f.readlines()
-    text = [i.strip() for i in text if i[0] != "#"]
-    tnum = int(text[0])
-    e = float(text[1])
-    f = [float(i) for i in text[2:2+tnum*3]]
-    f = np.array(f).reshape((tnum,3))
-    return e,f
-
-def mkORCAFunc(command):
-    def calcORCAForce(topo,xyz,n):
-        writeORCAForce(topo,xyz)
-        if n > 0:
-            os.system("cp force_%i.gbw force.gbw"%(n))
-        os.system(command+' force.inp "--map-by socket:OVERSUBSCRIBE" > LOG')
-        e,f = readORCAEnerForce()
-        os.system("cp force.gbw force_%i.gbw"%n)
-        os.system("rm force.*")
-        return e,f
-    return calcORCAForce
-
-def testForce(topo,xyz):
-    force = np.zeros(xyz.shape)
-    x,y = xyz[0,0],xyz[0,1]
-    func1 = lambda x,y: np.exp(- (x - 5) ** 2 / 2 / 16) * np.exp(- (y - 5) ** 2 / 2 / 16)
-    func2 = lambda x,y: np.exp(- (x + 5) ** 2 / 2 / 16) * np.exp(- (y + 5) ** 2 / 2 / 16)
-    func3 = lambda x,y: 0.00025 * x ** 2 * y ** 2
-    e = func1(x,y) + func2(x,y) + func3(x,y)
-    force[0,0] = 0.0005*x*y**2 + (-x/16 - 5/16)*np.exp(-(x + 5)**2/32)*np.exp(-(y + 5)**2/32) + (-x/16 + 5/16)*np.exp(-(x - 5)**2/32)*np.exp(-(y - 5)**2/32)
-    force[0,1] = 0.0005*x**2*y + (-y/16 - 5/16)*np.exp(-(x + 5)**2/32)*np.exp(-(y + 5)**2/32) + (-y/16 + 5/16)*np.exp(-(x - 5)**2/32)*np.exp(-(y - 5)**2/32)
-    return e,force
-
+def calcGauGrad(atom, crd, template, path="g09"):
+    """
+    Calculate gradient using Gaussian.
+    """
+    with open("tmp.gjf", "w") as f:
+        f.write(genQMInput(atom, crd, template))
+    os.system("{} tmp.gjf".format(path))
+    grad = readFile("tmp.log", lambda x: readGauGrad(x, len(atom)))
+    os.system("cp tmp.chk old.chk")
+    return grad
 
 #Chain-of-state
 def distance(a,b): 
-    return (((a - b) ** 2).sum() / a.shape[0]) ** 0.5 
+    """
+    Calc the distance between two vectors.
+    """
+    return (((a - b) ** 2).sum()) ** 0.5 
  
 def decomp(a,b):
     #return va,vb
     #va + vb = a
     #va .* vb = 0
     #vb parrallel to b
+    a, b = a.ravel(), b.ravel()
     m = np.dot(a,b) / np.dot(b,b)
-    return a - m * b, m * b
+    return (a - m * b).reshape((-1,3)), (m * b).reshape((-1,3))
 
 
-def spring(a,b,sk=1.0): 
-    dist = (((a - b) ** 2).sum() / a.shape[0]) ** 0.5 
-    fa, fb = np.zeros(a.shape), np.zeros(b.shape) 
-    for ia in range(a.shape[0]): 
-        fa[ia] = (a[ia] - b[ia]) / dist 
-    fa = -sk * fa 
-    fb[:] = -fa[:] 
-    return fa,fb  
+def spring(a, b, k):
+    """
+    Generate spring force from a to b.
+    """
+    return (a - b) * 2. * k
 
-def cispring(a,b,ei,emax,eref,deltak=0.00125,kmax=1.0):
-    if ei > eref:
-        k = kmax - deltak * (emax - ei) / (emax - eref)
-    else:
-        k = kmax - deltak
-    dist = (((a - b) ** 2).sum() / a.shape[0]) ** 0.5
-    fa, fb = np.zeros(a.shape), np.zeros(b.shape)
-    for ia in range(a.shape[0]):
-        fa[ia] = (a[ia] - b[ia]) / dist
-    fa = -k * fa
-    fb[:] = -fa[:]
-    return fa,fb
 
-def score(i,grad):
-    t = np.sqrt((grad[i] ** 2).sum() / grad[i].shape[0])
-    return 1. / (1. + np.exp(-(t + 5)))
+def genPosFunc(pos_list, val_list):
+    """
+    Generate reaction pathway by interpolating and return pathway function.
+    """
+    list1d = [i.ravel() for i in pos_list]
+    funclist = []
+    for p in range(list1d.shape[0]):
+        k = [i[p] for i in list1d]
+        funclist.append(interpolate.interp1d(val_list,k,kind="cubic"))
+    def posfunc(alpha):
+        pos = np.zeros((len(funclist,)))
+        for n,f in enumerate(funclist):
+            pos[n] = f(alpha)
+        return pos.reshape((-1, 3))
+    return posfunc
 
-def scale(force,k):
-    rf = force.reshape((int(force.shape[0]/3),3)) * 0.5
-    maxd = (rf ** 2).sum(axis=1).max() ** 0.5
-    if maxd < k:
-        return force * 0.5
-    else:
-        return force * 0.5 / maxd * k
 
-def runChainOfState(topo,xyzs,force,method="STRING",fixend=False,k=0.1,sk=0.5,delta=0.00001,enfirst=0.0,enlast=0.0):
-    calcs = []
-    for n,xyz in enumerate(xyzs):
-        if fixend:
-            if n == 0 or n == len(xyzs) - 1:
-                calcs.append((enfirst if n == 0 else enlast,np.zeros(xyz.shape)))
-                print(calcs[-1][0], end=" ")
-                continue
-        calcs.append(force(topo,xyz,n))
-        print(calcs[-1][0], end=" ")
-    energies = [i[0] for i in calcs]
-    if method == "CINEB" and fixend:
-        energies[-1] = enlast
-        energies[0] = enfirst
-    energies = np.array(energies)
-    print()
-    forces = [i[1] * 1.889725989 for i in calcs] 
-    forces = [i - i.mean(axis=0) for i in forces]
-    forces = [i.reshape((i.shape[0]*i.shape[1],)) for i in forces]
-    prexyzs = [i.reshape((i.shape[0]*i.shape[1],)) for i in xyzs]
+def numGrad(posfunc, alpha):
+    """
+    Numerically calc the gradient at each point.
+    """
+    delta = 0.002
+    grad1d = (posfunc(alpha + delta) - posfunc(alpha - delta)) / 2. / delta
+    return grad1d.reshape((-1, 3))
 
-    ss = [0.0] 
-    for i in range(len(prexyzs)-1): 
-        ss.append(distance(prexyzs[i],prexyzs[i+1])) 
-    alpha = [sum(ss[:i+1])/sum(ss) for i in range(len(ss))]
-    grad = [np.zeros(i.shape) for i in prexyzs]
-    for d in range(prexyzs[0].shape[0]):
-        y = [i[d] for i in prexyzs]
-        func = interpolate.interp1d(alpha,y,kind="cubic")
-        for n in range(len(prexyzs)):
-            if n == 0:
-                grad[n][d] = (func(delta) - prexyzs[n][d]) / delta
-            elif n == len(prexyzs) - 1:
-                grad[n][d] = (prexyzs[n][d] - func(1.0 - delta)) / delta
-            else:
-                grad[n][d] = (func(alpha[n] + delta) - func(alpha[n] - delta)) / 2.0 / delta
-    #force decomposition
-    if method == "STRING":
-        newforces = []
-        for i in range(len(forces)):
-            vrt,prl = decomp(forces[i],grad[i])
-            newforces.append(vrt)
-        #renew position
-        if fixend:
-            newforces[0][:] = 0
-            newforces[-1][:] = 0
-        else:
-            newforces[0][:] = forces[0][:]
-            newforces[-1][:] = forces[-1][:]
-        newforces = [scale(i,k) for i in newforces]
-        newxyzs = [prexyzs[i] - newforces[i] for i in range(len(prexyzs))]
-        #interpolation again
-        ss = [0.0] 
-        for i in range(len(newxyzs)-1): 
-            ss.append(distance(newxyzs[i],newxyzs[i+1])) 
-        alpha = np.array([sum(ss[:i+1])/sum(ss) for i in range(len(ss))])
-        res = np.zeros((len(newxyzs),newxyzs[0].shape[0]))
-        for d in range(newxyzs[0].shape[0]):
-            func = interpolate.interp1d(alpha,np.array([i[d] for i in newxyzs]),kind="cubic")
-            tmp = func(np.linspace(0.0,1.0,len(ss)))
-            for n in range(len(tmp)):
-                res[n,d] = tmp[n]
-        #return
-        return energies,[i.reshape(xyzs[0].shape) for i in res] 
-    if method == "SIMPLESTRING":
-        newforces = [i for i in forces]
-        #renew position
-        if fixend:
-            newforces[0][:] = 0
-            newforces[-1][:] = 0
-        else:
-            newforces[0][:] = forces[0][:]
-            newforces[-1][:] = forces[-1][:]
-        newforces = [scale(i,k) for i in newforces]
-        newxyzs = [prexyzs[i] - newforces[i] for i in range(len(prexyzs))]
-        #interpolation again
-        ss = [0.0] 
-        for i in range(len(newxyzs)-1): 
-            ss.append(distance(newxyzs[i],newxyzs[i+1])) 
-        alpha = np.array([sum(ss[:i+1])/sum(ss) for i in range(len(ss))])
-        res = np.zeros((len(newxyzs),newxyzs[0].shape[0]))
-        for d in range(newxyzs[0].shape[0]):
-            func = interpolate.interp1d(alpha,np.array([i[d] for i in newxyzs]),kind="cubic")
-            tmp = func(np.linspace(0.0,1.0,len(ss)))
-            for n in range(len(tmp)):
-                res[n,d] = tmp[n]
-        #return
-        return energies,[i.reshape(xyzs[0].shape) for i in res] 
-    elif method == "TSTRING":
-        newforces = [i for i in forces]
-        #renew position
-        if fixend:
-            newforces[0][:] = 0
-            newforces[-1][:] = 0
-        else:
-            newforces[0][:] = forces[0][:]
-            newforces[-1][:] = forces[-1][:]
-        newforces = [scale(i,k) for i in newforces]
-        newxyzs = [prexyzs[i] - newforces[i] for i in range(len(prexyzs))]
-        #choose sample
-        distmat = np.zeros((len(newxyzs), len(newxyzs)))
-        for i in range(len(newxyzs)):
-            for j in range(i,len(newxyzs)):
-                if i == j:
-                    distmat[i,j] = 0.0
+
+def genLinearConf(start, end, points):
+    confs = []
+    for i in range(points + 1):
+        confs.append(start * (1 - i/points) + end * i/points)
+    return confs 
+
+
+def runChainOfState(atom, xyzs, method="NEB", force=None, template=None, Kspring=10.0*KCAL/MOL/ANGSTROM**2, Rstep=0.5, dG=-1.*KCAL/MOL, dR=0.1*ANGSTROM, maxcycle):
+    # calc the energy of the first and last structure
+    efirst, _ = calcGauGrad(atom, xyzs[0], template)
+    elast, _ = calcGauGrad(atom, xyzs[-1], template)
+    energy = np.zeros((len(xyzs),))
+    coord = [np.zeros(i.shape) for i in xyzs]
+    for n,i in enumerate(xyzs):
+        coord[n][:] = i[:]
+    pe_grad = [np.zeros(i.shape) for i in xyzs]
+    path_grad = [np.zeros(i.shape) for i in xyzs]
+    massm = genMassMat(atom)
+    energy[0] = efirst
+    energy[-1] = elast
+    for ncycle in range(1, maxcycle+1):
+        print("Cycle %i"%ncycle)
+        # calc gradient of PE
+        for nimage in range(1,len(xyzs)-1):
+            e,g = calcGauGrad(atom, coord[nimage], template)
+            energy[nimage] = e
+            pe_grad[nimage] = g 
+            print("E: %.4f  "%e, end="")
+        print()
+        # get pathway
+        alpha = [0.0]
+        for n in range(1,len(xyzs)):
+            alpha.append(sum(alpha) + distance(xyzs[n-1], xyzs[n]))
+        alpha = [i / sum(alpha) for i in alpha]
+        posfunc = genPosFunc(coord, alpha)
+        if "NEB" in method:
+            # get direction of NEB gradient
+            for n,a in enumerate(alpha):
+                if n == 0 or n == len(alpha):
+                    continue
+                path_grad[n] = numGrad(posfunc, a)
+            # calc elastic band grad
+            neb_grad = [np.zeros(i.shape) for i in xyzs]
+            for i in range(1,len(xyzs)-1):
+                k1 = spring(coord[i], coord[i-1], Kspring)
+                k2 = spring(coord[i], coord[i+1], Kspring)
+                neb_grad[i] = k1 + k2
+            # summarize PE grad and NEB grad
+            for i in range(1, len(xyzs)-1):
+                gv, gh = decomp(pe_grad[i], path_grad[i])
+                if "CI" in method:
+                    if i == np.argmax(energy):
+                        gh = - gh
                 else:
-                    distmat[i,j] = distance(newxyzs[i].newxyzs[j])
-                    distmat[j,i] = distance(newxyzs[i].newxyzs[j])
-        
-        #interpolation again
-        ss = [0.0] 
-        for i in range(len(newxyzs)-1): 
-            ss.append(distance(newxyzs[i],newxyzs[i+1])) 
-        alpha = np.array([sum(ss[:i+1])/sum(ss) for i in range(len(ss))])
-        res = np.zeros((len(forces),newxyzs[0].shape[0]))
-        for d in range(newxyzs[0].shape[0]):
-            func = interpolate.interp1d(alpha,np.array([i[d] for i in newxyzs]),kind="cubic")
-            tmp = func(np.linspace(0.0,1.0,len(forces)))
-            for n in range(len(tmp)):
-                res[n,d] = tmp[n]
-        #return
-        return energies,[i.reshape(xyzs[0].shape) for i in res]
-    elif method == "NEB":
-        along,vertical = [np.zeros(i.shape) for i in forces],[]
-        for i in range(len(forces)):
-            vrt,prl = decomp(forces[i],grad[i])
-            vertical.append(vrt)
-        for i in range(len(forces)-1):
-            ia,ib = i,i+1
-            fa,fb = spring(prexyzs[ia],prexyzs[ib],sk)
-            vrt,prl = decomp(fa,grad[ia])
-            along[ia] = prl
-            vrt,prl = decomp(fa,grad[ib])
-            along[ib] = prl
-        newforces = [vertical[i] + along[i] for i in range(len(vertical))]
-        newforces[0][:] = forces[0][:]
-        newforces[-1][:] = forces[-1][:]
-    elif method == "CINEB":
-        ts_images = []
-        ts_prl = []
-        for n,i in enumerate(energies):
-            if n == 0 or n == len(energies) - 1:
-                continue
-            if n == 1:
-                if i > max([energies[0],energies[2],energies[3]]):
-                    ts_images.append(n)
-                continue
-            if n == len(energies) - 2:
-                if i > max([energies[n+1],energies[n-1],energies[n-2]]):
-                    ts_image.append(n)
-                continue
-            if i >= max([energies[n-1],energies[n-2],energies[n+1],energies[n+2]]):
-                ts_images.append(n)
-                continue
-        along,vertical = [np.zeros(i.shape) for i in forces],[]
-        for i in range(len(forces)):
-            vrt,prl = decomp(forces[i],grad[i])
-            vertical.append(vrt)
-            if i in ts_images:
-                ts_prl.append(prl)
+                    _, gh = decomp(neb_grad[i], path_grad[i])
+                gsum = gv + gh
+                # renew position
+                coord[i] = coord[i] - Rstep * gsum / massm 
+        # output pathway
+        for i in range(len(xyzs)):
+            title = "Cycle %i    Image %i    Energy:%.6f\n"%(ncycle, i, energy[i] / EH)
+            writeXYZ("pathway-%i.xyz"%i, atom, coord[i], title=title, append=True)
 
-        emax = max(energies)
-        eref = min([energies[0],energies[-1]])
-
-        for i in range(len(forces)-1):
-            ia,ib = i,i+1
-            fa,fb = cispring(prexyzs[ia],prexyzs[ib],max([energies[ia],energies[ib]]),emax,eref,kmax=sk,deltak=0.5*sk)
-            vrt,prl = decomp(fa,grad[ia])
-            along[ia] += prl
-            vrt,prl = decomp(fa,grad[ib])
-            along[ib] += prl
-        for n in range(len(ts_images)):
-            along[ts_images[n]] = - 2 * ts_prl[n]
-        newforces = [vertical[i] + along[i] for i in range(len(vertical))]
-        newforces[0][:] = forces[0][:]
-        newforces[-1][:] = forces[-1][:]
-    #renew position
-    newforces = [scale(i,k) for i in newforces]
-    if fixend:
-        newforces[0][:] = 0
-        newforces[-1][:] = 0
-    newxyzs = [prexyzs[i] - newforces[i] for i in range(len(prexyzs))]
-    #return
-    return energies,[i.reshape(xyzs[0].shape) for i in newxyzs]    
-
-
-
-
-if __name__ == "__main__":
-    #Argparse
-    import json
-    env_dir = os.environ
-    if len(sys.argv[]) > 1:
-        config_name = sys.argv[1]
-    else:
-        config_name = "config.json"
-    with open(config_name, "r") as f:
-        config = json.load(f)
-
-    inter = config["inter"] + 1
-    initxyz = []
-    for i in config["files"]:
-        topo,xyz = readXYZ(i)
-        initxyz.append(xyz)
-    xyzs = [initxyz[0]]
-    for i in range(len(initxyz)-1):
-        for j in range(1,inter):
-            xyzs.append(initxyz[i] * (inter - 1 - j) / (inter - 1) + initxyz[i+1] * j / (inter - 1))
-
-    engine = config["engine"]
-    method = config["algorithm"]
-    if engine == "GAU":
-        force = mkGauFunc(config["gau_command"], config["nproc"], method=config["gau_method"], basis=config["gau_basis"], extra=config["gau_extra"], charge=config["charge"], multi=config["multi"], endfile=config["gau_endfile"])
-    if engine == "XTB":
-        force = mkXTBFunc(config["xtb_command"])
-    if engine == "ORCA":
-        force = mkORCAFunc(config["orca_command"])
-
-    for i in range(config["cycles"]):
-        print("CYCLE %i:"%i)
-        e,xyzs = runChainOfState(topo,xyzs,force,method=method,fixend=config["fixend"],k=config["norm"],sk=config["springK"],enfirst=config["enfirst"],enlast=config["enlast"])
-        for n,xyz in enumerate(xyzs):
-            writeXYZ("force%i_%i"%(i,n),topo,xyz,title="%f"%e[n])
-        #e,xyzs = gausimplestring(topo,xyzs)
-        print("MAX: %f\n"%e[1:-1].max())
