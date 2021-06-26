@@ -71,6 +71,18 @@ def readGauGrad(text, natoms):
               for i in forces]
     return ener * EH, - np.array(forces) * EH / BOHR
 
+def readGauEner(text, natoms):
+    """
+    Read Gaussian output and find energy gradient.
+    """
+    ener = [i for i in text if "SCF Done:" in i]
+    if len(ener) != 0:
+        ener = ener[-1]
+        ener = np.float64(ener.split()[4])
+    else:
+        ener = np.float64([i for i in text if "Energy=" in i][-1].split()[1])
+    return ener * EH
+
 
 def writeXYZ(fname, atom, xyz, title="Title", append=False, unit=ANGSTROM):
     """
@@ -108,37 +120,6 @@ def genQMInput(atom, crd, temp):
     return "".join(wrt)
 
 
-def genMassMat(atom):
-    """
-    Generate matrix of mass.
-    """
-    massd = {"H": 1.008,
-             "C": 12.011,
-             "N": 14.007,
-             "O": 15.999,
-             "S": 32.066,
-             "CL": 35.453,
-             "BR": 79.904, }
-    massv = np.array([massd[i.upper()] for i in atom])
-    massm = np.zeros((len(atom), 3))
-    massm[:, 0] = massv
-    massm[:, 1] = massv
-    massm[:, 2] = massv
-    return massm.reshape((-1, 3)) * AMU
-
-
-def calcGauGrad(atom, crd, template, path="g09"):
-    """
-    Calculate gradient using Gaussian.
-    """
-    with open("tmp.gjf", "w") as f:
-        f.write(genQMInput(atom, crd, template))
-    os.system("{} tmp.gjf".format(path))
-    grad = readFile("tmp.log", lambda x: readGauGrad(x, len(atom)))
-    return grad
-
-# Chain-of-state
-
 
 def distance(a, b):
     """
@@ -147,219 +128,157 @@ def distance(a, b):
     return (((a - b) ** 2).sum()) ** 0.5
 
 
-def decomp(a, b):
-    # return va,vb
-    # va + vb = a
-    # va .* vb = 0
-    # vb parrallel to b
-    a, b = a.ravel(), b.ravel()
-    m = np.dot(a, b) / np.dot(b, b)
-    return (a - m * b).reshape((-1, 3)), (m * b).reshape((-1, 3))
+class InterpolatePath:
+
+    def __init__(self, coords):
+        self.dofFuncList = []
+        dists = []
+        for i in range(len(coords)):
+            if i > 0:
+                dists.append(distance(coords[i], coords[i-1]))
+            else:
+                dists.append(0.0)
+        alphas = [sum(dists[:i+1])/sum(dists) for i in range(len(dists))]
+        print(alphas)
+        list1d = [i.ravel() for i in coords]
+        for p in range(len(list1d[0])):
+            k = [i[p] for i in list1d]
+            self.dofFuncList.append(interpolate.interp1d(alphas, k, kind="cubic"))
 
 
-def spring(a, b, k):
-    """
-    Generate spring force from a to b.
-    """
-    return (a - b) * 2. * k
-
-
-def genPosFunc(pos_list, val_list):
-    """
-    Generate reaction pathway by interpolating and return pathway function.
-    """
-    list1d = [i.ravel() for i in pos_list]
-    funclist = []
-    for p in range(len(list1d[0])):
-        k = [i[p] for i in list1d]
-        funclist.append(interpolate.interp1d(val_list, k, kind="cubic"))
-
-    def posfunc(alpha):
-        pos = np.zeros((len(funclist,)))
-        for n, f in enumerate(funclist):
+    def getCoord(self, alpha):
+        pos = np.zeros((len(self.dofFuncList,)))
+        for n, f in enumerate(self.dofFuncList):
             pos[n] = f(alpha)
-        return pos.reshape((-1, 3))
-    return posfunc
+        return pos.reshape((-1,3))
 
 
-def numGrad(posfunc, alpha):
+
+def calcGauGrad(atom, crd, template, path="g09"):
     """
-    Numerically calc the gradient at each point.
+    Calculate gradient using Gaussian.
     """
-    delta = 0.0001
-    grad1d = (posfunc(alpha + delta) - posfunc(alpha - delta)) / 2. / delta
-    return grad1d
+    os.system("rm tmp.gjf tmp.log")
+    with open("tmp.gjf", "w") as f:
+        f.write(genQMInput(atom, crd, template))
+    os.system("{} tmp.gjf".format(path))
+    ener, grad = readFile("tmp.log", lambda x: readGauGrad(x, len(atom)))
+    return ener, grad
 
 
-def genLinearConf(start, end, points):
+def calcGauEner(atom, crd, template, path="g09"):
     """
-    Interpolate conformations between start and end confs. 
-    points :: The total conformations on the linear pathway. 
-              Return [start, end] is points is smaller than 2.
+    Calculate gradient using Gaussian.
     """
-    if points < 2:
-        return [start, end]
-    confs = []
-    for i in range(points):
-        confs.append(start * (1 - i / (points - 1)) + end * i / (points - 1))
-    return confs
+    os.system("rm tmp.gjf tmp.log")
+    with open("tmp.gjf", "w") as f:
+        f.write(genQMInput(atom, crd, template))
+    os.system("{} tmp.gjf".format(path))
+    ener = readFile("tmp.log", lambda x: readGauEner(x, len(atom)))
+    return ener
+
+# Chain-of-state
 
 
-def runChainOfState(atom, xyzs, method="NEB", inite=None, jobname="", template=None, Kspring=10.0 * KCAL / MOL / ANGSTROM**2, LRate=0.5, Rmax=0.1 * ANGSTROM, dR=0.1 * ANGSTROM, maxcycle=100):
-    # calc the energy of the first and last structure
-    energy = np.zeros((len(xyzs),))
-    if inite is not None:
-        efirst = inite[0]
-        elast = inite[-1]
-    else:
-        efirst, _ = calcGauGrad(atom, xyzs[0], template)
-        elast, _ = calcGauGrad(atom, xyzs[-1], template)
-    coord = [np.zeros(i.shape) for i in xyzs]
-    new_coord = [np.zeros(i.shape) for i in xyzs]
-    for n, i in enumerate(xyzs):
-        coord[n][:] = i[:]
-        new_coord[n][:] = i[:]
-    pe_grad = [np.zeros(i.shape) for i in xyzs]
-    path_grad = [np.zeros(i.shape) for i in xyzs]
-    massm = genMassMat(atom)
-    energy[0] = efirst
-    energy[-1] = elast
-    moves = np.zeros(energy.shape)
-    for ncycle in range(1, maxcycle + 1):
-        print("Cycle %i" % ncycle)
-        # calc gradient of PE
-        for nimage in range(len(xyzs)):
-            if nimage != 0 and nimage != len(xyzs) - 1:
-                e, g = calcGauGrad(atom, coord[nimage], template)
-                energy[nimage] = e
-                pe_grad[nimage] = g
-            print("E: %.4f  " %
-                  ((energy[nimage] - energy[0]) / (KCAL / MOL)), end="  ")
+
+
+def runChainOfState(atom, xyzs, method="Euler", dT=0.01, templateEner="energy.gjf", templateForce="force.gjf"):
+    # calc the energy and force of the first and last structure
+    if method == "Euler":
+        print("Euler step...")
+        energyList = []
+        gradList = []
+        newPosList = []
+        for nrep in range(len(xyzs)):
+            print("%i"%nrep, end=" ")
+            ener, grad = calcGauGrad(atom, xyzs[nrep], templateForce)
+            energyList.append(ener)
+            newPosList.append(xyzs[nrep] - dT * grad)
+            print("%12.6f"%(ener/EH))
         print()
-        # get pathway
-        alpha = [0.0]
-        for n in range(1, len(xyzs)):
-            alpha.append(alpha[n - 1] + distance(coord[n - 1], coord[n]))
-        alpha = [i / alpha[-1] for i in alpha]
-        posfunc = genPosFunc(coord, alpha)
-        if "NEB" in method:
-            grad_sum = [np.zeros(i.shape) for i in xyzs]
+        
+    elif method == "Runge-Kutta":
+        energyList = []
+        gradList = []
+        newPosList = []
+        for nrep in range(len(xyzs)):
+            print(nrep, end="/")
+            # calc k1
+            ener, grad = calcGauGrad(atom, xyzs[nrep], templateForce)
+            energyList.append(ener)
+            k1 = dT * grad
+            print("k1", end="/")
+            # calc k2
+            ener, grad = calcGauGrad(atom, xyzs[nrep] + 0.5 * k1, templateForce)
+            k2 = dT * grad
+            print("k2", end="/")
+            # calc k3 
+            ener, grad = calcGauGrad(atom, xyzs[nrep] + 0.5 * k2, templateForce)
+            k3 = dT * grad
+            print("k3", end="/")
+            # calc k4
+            ener, grad = calcGauGrad(atom, xyzs[nrep] + k3, templateForce)
+            k4 = dT * grad
+            print("k4")
+            newPosList.append(xyzs[nrep] - 1.0/6.0 * k1 - 1.0/3.0 * k2 - 1.0/3.0 * k3 - 1.0/6.0 * k4)
+    
+    # build path
+    path = InterpolatePath(newPosList)
+    alpha = np.linspace(0.0, 1.0, len(newPosList))
+    coordList = [path.getCoord(i) for i in alpha]
 
-            # get direction of NEB gradient
-            for n, a in enumerate(alpha):
-                if n == 0 or n == len(alpha) - 1:
-                    continue
-                path_grad[n] = numGrad(posfunc, a)
-            # calc elastic band grad
-            neb_grad = [np.zeros(i.shape) for i in xyzs]
-            for i in range(1, len(xyzs) - 1):
-                k1 = spring(coord[i], coord[i - 1], Kspring)
-                k2 = spring(coord[i], coord[i + 1], Kspring)
-                neb_grad[i] = k1 + k2
-            # summarize PE grad and NEB grad
-            for i in range(1, len(xyzs) - 1):
-                gv, gh = decomp(pe_grad[i], path_grad[i])
-                if "CI" in method:
-                    if i == np.argmax(energy):
-                        gh = - gh
-                else:
-                    _, gh = decomp(neb_grad[i], path_grad[i])
-                gsum = gv + gh
-                moves[i] = np.sqrt(np.power(Rstep * gsum, 2).sum())
-                grad_sum[i] = gsum
-                if max(moves) > Rmax:
-                    scale = Rmax / max(moves)
-                else:
-                    scale = 1.0
-            # renew position
-            for i in range(1, len(xyzs) - 1):
-                new_coord[i] = coord[i] - Rstep * grad_sum[i] * scale
-        print(moves / ANGSTROM)
-        # output pathway
-        for i in range(len(xyzs)):
-            title = "Cycle %i    Image %i    Energy:%.6f\n" % (
-                ncycle, i, energy[i] / EH)
-            writeXYZ("%s-pathway%i.xyz" % (jobname, ncycle), atom,
-                     coord[i], title=title, append=True)
-        # renew coords
-        for i in range(len(coord)):
-            coord[i] = new_coord[i]
-    return energy, coord
+    return energyList, coordList
 
 
 def argparse():
     CONF = None
-    for n, i in enumerate(sys.argv):
-        if i == "-j" or i == "--json":
-            with open(sys.argv[n + 1], "r") as f:
-                CONF = json.loads("".join([i for i in f]))
-    if CONF is None:
+    with open(sys.argv[1], "r") as f:
+        try:
+            string = "".join([i for i in f])
+            CONF = json.loads(string)
+        except:
+            print("""
+        Usage:
+            python stringmethod.py config.json
+                """)
+            exit()
+    if "dt" not in CONF:
+        CONF["dt"] = 0.0001
+    if "outEnergy" not in CONF:
+        CONF["outEnergy"] = "energy.txt"
+    if "method" not in CONF:
+        CONF["method"] = "Euler"
+    if "energyTempelate" not in CONF:
+        CONF["energyTempelate"] = "energy.gjf"
+    if "forceTempelate" not in CONF:
+        CONF["forceTempelate"] = "force.gjf"
+    if "initPath" not in CONF:
         print("""
-    Usage:
-        python sot.py -j/--json config.json
-            """)
-    for NC in range(len(CONF["workflow"])):
-        if "Kspring" not in CONF["workflow"][NC]["parameter"]:
-            CONF["workflow"][NC]["parameter"]["Kspring"] = 10.0
-        if "LRate" not in CONF["workflow"][NC]["parameter"]:
-            CONF["workflow"][NC]["parameter"]["LRate"] = 0.001
-        if "Rmax" not in CONF["workflow"][NC]["parameter"]:
-            CONF["workflow"][NC]["parameter"]["Rmax"] = 0.10
-        if "maxcycle" not in CONF["workflow"][NC]["parameter"]:
-            CONF["workflow"][NC]["parameter"]["maxcycle"] = 30
-    jobnames = [i["jobname"] for i in CONF["workflow"]]
-    if len(jobnames) != len(list(set(jobnames))):
-        print("""
-    The name of each job should be different or the output file will be messy.
-            """)
+    Error: Initial pathway need to be offered in XYZ format.
+        """)
+        exit()
     return CONF
 
 
 def main():
     conf = argparse()
-    # generate init confs
-    # if there are 2 or 3 images, then doing linear interpole
-    # if there are 4 images or more, do cubic
-    xyz_list = readFile(conf["coord"], readMultiXYZ)
+    
+    xyz_list = readFile(conf["initPath"], readMultiXYZ)
     atom = xyz_list[0][0]
-    xyzs = [i[1] * ANGSTROM for i in xyz_list]
-    totalI = conf["index"][-1] - conf["index"][0]
-    if len(xyzs) == 2:
-        coord = genLinearConf(xyzs[0], xyzs[1], totalI)
-    elif len(xyzs) == 3:
-        part1 = genLinearConf(xyzs[0], xyzs[1], conf["index"][1] - conf["index"][0] + 1)
-        part2 = genLinearConf(xyzs[1], xyzs[2], conf["index"][2] - conf["index"][1] + 1)
-        coord = part1[:-1] + part2[1:]
-    else:
-        # get pathway
-        alpha = [0.0]
-        for n in range(1, len(xyzs)):
-            alpha.append(alpha[n - 1] + distance(xyzs[n - 1], xyzs[n]))
-        alpha = [i / alpha[-1] for i in alpha]
-        posfunc = genPosFunc(xyzs, alpha)
-        new_alpha = [0.0]
-        for n, a in enumerate(alpha):
-            if n == 0:
-                continue
-            i_end = conf["index"][n]
-            i_start = conf["index"][n - 1]
-            a_start = alpha[n - 1]
-            a_end = a
-            for p in range(i_end - i_start):
-                new_alpha.append((a_end - a_start) /
-                                 (i_end - i_start) * p + a_start)
-        new_alpha.append(1.0)
-        coord = [posfunc(a) for a in new_alpha]
-        coord[0] = xyzs[0]
-        coord[-1] = xyzs[-1]
+    coord = [i[1] * ANGSTROM for i in xyz_list]
+    print(len(coord))
     # run cycles
-    for n, param in enumerate(conf["workflow"]):
-        if n == 0:
-            energy, coord = runChainOfState(atom, coord, method=param["method"], template=conf["template"], Kspring=param[
-                                            "Kspring"] * KCAL / MOL / ANGSTROM**2, LRate=param["LRate"], Rmax=param["Rmax"] * ANGSTROM, maxcycle=param["maxcycle"])
-        else:
-            energy, coord = runChainOfState(atom, coord, inite=energy, method=param["method"], template=conf["template"], Kspring=param[
-                                            "Kspring"] * KCAL / MOL / ANGSTROM**2, LRate=param["LRate"], Rmax=param["Rmax"] * ANGSTROM, maxcycle=param["maxcycle"])
+    ncycle = 1
+    while True:
+        energy, coord = runChainOfState(atom, coord, method=conf["method"], templateEner=conf["energyTempelate"], templateForce=conf["forceTempelate"], dT=conf["dt"])
+        with open(conf["outEnergy"], "a") as f:
+            text = " ".join(["%16.8f"%(i/EH) for i in energy])
+            text = text + "\n"
+            f.write(text)
+        crdname = "string-%i.xyz"%ncycle
+        for nrep in range(len(energy)):
+            writeXYZ(crdname, atom, coord[nrep], append=True, title="%16.8f"%(energy[nrep]/EH))
+        ncycle += 1        
 
 
 if __name__ == '__main__':
