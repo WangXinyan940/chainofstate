@@ -1,23 +1,8 @@
 {
-    "coord":"init.xyz",
-    "index":[0, 2, 4, 6, 8, 10, 12, 14, 16],
-    "template":"template.gjf",
-    "workflow":[
-        {
-            "jobname":"NEB-step1",
-            "method":"CINEB",
-            "Kspring":5.0,
-            "LRate":0.001,
-            "Rmax":0.10,
-            "maxcycle":5
-        },
-        {
-            "jobname":"NEB-step2",
-            "method":"CINEB",
-            "Kspring":5.0,
-            "LRate":0.0005,
-            "Rmax":0.05,
-            "maxcycle":20
-        }
-    ]
+    "energyTemplate": "energy.gjf",
+    "forceTemplate": "force.gjf",
+    "dt": 0.0001,
+    "method": "Euler",
+    "outEnergy": "energy.txt",
+    "initPath": "path.xyz"
 }
